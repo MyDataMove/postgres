@@ -53,6 +53,94 @@
 
 static void usage(const char *progname);
 
+static char * _stringReplace(const char *str, const char *find, const char *replace);
+static void _doReplacements(ArchiveHandle *AH, TocEntry *te);
+static void _doAllReplacements(Archive *AHX);
+
+
+static char * 
+_stringReplace(const char *str, const char *find, const char *replace)
+{ 
+    char* result; 
+    int i, cnt = 0; 
+    int rlen = strlen(replace); 
+    int flen = strlen(find); 
+
+    // count number of times find string occurs in s
+    for (i = 0; str[i] != '\0'; i++) { 
+        if (strstr(&str[i], find) == &str[i]) { 
+            cnt++; 
+
+            // move past occurrence
+            i += flen - 1; 
+        } 
+    } 
+    
+    if(cnt == 0)
+      return (char*) str; 
+
+    // make a new buffer large enough for replaced string 
+    result = (char*)malloc(i + cnt * (rlen - flen) + 1); 
+
+    i = 0; 
+    while (*str) { 
+        // if the current pointer points to the find word,
+        // copy replace word to buffer and move past
+        if (strstr(str, find) == str) { 
+            strcpy(&result[i], replace); 
+            i += rlen; 
+            str += flen; 
+        } 
+        else
+        {
+           // otherwise, copy only current character and repeat
+            result[i++] = *str++; 
+        }    
+    } 
+
+    result[i] = '\0'; 
+    return result; 
+} 
+
+static void
+_doAllReplacements(Archive *AHX) 
+{
+  ArchiveHandle *AH = (ArchiveHandle *) AHX;
+  TocEntry   *te;
+  
+  for (te = AH->toc->next; te != AH->toc; te = te->next)
+  {
+    _doReplacements(AH, te);
+  }
+}
+    
+static void
+_doReplacements(ArchiveHandle *AH, TocEntry *te) 
+{
+  RestoreOptions *ropt = AH->public.ropt;
+  SimpleStringListCell *fcell;
+  SimpleStringListCell *rcell;
+
+  for (fcell = ropt->toReplace.head, rcell = ropt->replacements.head; fcell && rcell; fcell = fcell->next, rcell = rcell->next)
+  {
+    if(te->namespace && *te->namespace) {
+      te->namespace = _stringReplace(te->namespace, fcell->val, rcell->val);
+    }
+    
+    if(te->defn != NULL) {
+      te->defn = _stringReplace(te->defn, fcell->val, rcell->val);
+    }
+    
+    if(te->copyStmt != NULL) {
+      te->copyStmt = _stringReplace(te->copyStmt, fcell->val, rcell->val);
+    }
+    
+    if(te->dropStmt != NULL) {
+      te->dropStmt = _stringReplace(te->dropStmt, fcell->val, rcell->val);
+    }
+  }
+}
+
 int
 main(int argc, char **argv)
 {
@@ -124,6 +212,7 @@ main(int argc, char **argv)
 		{"no-security-labels", no_argument, &no_security_labels, 1},
 		{"no-subscriptions", no_argument, &no_subscriptions, 1},
 		{"restrict-key", required_argument, NULL, 6},
+    {"replace", required_argument, NULL, 30},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -147,7 +236,7 @@ main(int argc, char **argv)
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_restore (PostgreSQL) " PG_VERSION);
+			puts("pg_restore (MyDataMove) " PG_VERSION);
 			exit_nicely(0);
 		}
 	}
@@ -287,9 +376,16 @@ main(int argc, char **argv)
 				set_dump_section(optarg, &(opts->dumpSections));
 				break;
 
-			case 6:
-				opts->restrict_key = pg_strdup(optarg);
-				break;
+      case 6:
+        opts->restrict_key = pg_strdup(optarg);
+        break;
+        
+      case 30:
+        char *find = strtok(optarg, ":");
+        char *replace = strtok(NULL, ":");
+        simple_string_list_append(&opts->toReplace, find);
+        simple_string_list_append(&opts->replacements, replace);
+        break;
 
 			default:
 				/* getopt_long already emitted a complaint */
@@ -432,6 +528,10 @@ main(int argc, char **argv)
 	else
 	{
 		ProcessArchiveRestoreOptions(AH);
+		
+		/* do replacement */
+		_doAllReplacements(AH);
+		
 		RestoreArchive(AH);
 	}
 

@@ -138,6 +138,8 @@ typedef struct _restoreOptions
 	SimpleStringList schemaExcludeNames;
 	SimpleStringList triggerNames;
 	SimpleStringList tableNames;
+	SimpleStringList toReplace;
+	SimpleStringList replacements;
 
 	int			useDB;
 	ConnParams	cparams;		/* parameters to use if useDB */

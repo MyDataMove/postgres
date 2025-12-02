@@ -1,0 +1,24 @@
+# update dnf
+dnf update -y
+
+# install git
+dnf install git -y
+
+# install postgres build prereqs
+dnf group install "Development Tools" -y
+dnf install libicu libicu-devel -y
+dnf install readline-devel -y
+dnf install perl perl-FindBin -y
+
+# create output directory
+mkdir ./build
+
+# configure (set output directory)
+./configure --prefix=$(pwd)/build
+
+# build/install everything
+make clean install
+
+# build/install only pg_dump
+cd src/bin/pg_dump
+make clean install

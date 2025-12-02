@@ -143,6 +143,7 @@ typedef struct _dumpableObject
 	CatalogId	catId;			/* zero if not a cataloged object */
 	DumpId		dumpId;			/* assigned by AssignDumpId() */
 	char	   *name;			/* object name (should never be NULL) */
+	char     *replacement_name; /* optional replacement name to be used in output archive */
 	struct _namespaceInfo *namespace;	/* containing namespace, or NULL */
 	DumpComponents dump;		/* bitmask of components requested to dump */
 	DumpComponents dump_contains;	/* as above, but for contained objects */

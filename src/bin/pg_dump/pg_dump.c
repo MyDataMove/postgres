@@ -129,6 +129,10 @@ static SimpleStringList tabledata_exclude_patterns = {NULL, NULL};
 static SimpleStringList tabledata_exclude_patterns_and_children = {NULL, NULL};
 static SimpleOidList tabledata_exclude_oids = {NULL, NULL};
 
+static SimpleStringList schema_replace_patterns = {NULL, NULL};
+static SimpleOidList schema_replace_oids = {NULL, NULL};
+static SimpleStringList schema_replacements = {NULL, NULL};
+
 static SimpleStringList foreign_servers_include_patterns = {NULL, NULL};
 static SimpleOidList foreign_servers_include_oids = {NULL, NULL};
 
@@ -160,11 +164,18 @@ static int	nseclabels = 0;
 #define DUMP_DEFAULT_ROWS_PER_INSERT 1
 
 /*
- * Macro for producing quoted, schema-qualified name of a dumpable object.
+ * Macros for producing quoted, schema-qualified name of a dumpable object.
  */
-#define fmtQualifiedDumpable(obj) \
-	fmtQualifiedId((obj)->dobj.namespace->dobj.name, \
-				   (obj)->dobj.name)
+#define fmtQualifiedDumpableSrc(obj) \
+  fmtQualifiedId((obj)->dobj.namespace->dobj.name, \
+           (obj)->dobj.name)
+           
+#define getDestSchemaName(nsp) \
+   (nsp)->dobj.replacement_name ? (nsp)->dobj.replacement_name : (nsp)->dobj.name
+           
+#define fmtQualifiedDumpableDest(obj) \
+  fmtQualifiedId(getDestSchemaName((obj)->dobj.namespace), \
+           (obj)->dobj.name)
 
 static void help(const char *progname);
 static void setup_connection(Archive *AH,
@@ -175,6 +186,14 @@ static void expand_schema_name_patterns(Archive *fout,
 										SimpleStringList *patterns,
 										SimpleOidList *oids,
 										bool strict_names);
+static void expand_schema_replace_patterns(Archive *fout,
+                    SimpleStringList *patterns,
+                    SimpleOidList *oids,
+                    SimpleStringList *replacements,
+                    bool strict_names);
+static char* lookup_schema_replacment(SimpleOidList *oids, 
+                    SimpleStringList *replacements, 
+                    Oid lookup);
 static void expand_extension_name_patterns(Archive *fout,
 										   SimpleStringList *patterns,
 										   SimpleOidList *oids,
@@ -197,18 +216,18 @@ static const char *getRoleName(const char *roleoid_str);
 static void collectRoleNames(Archive *fout);
 static void getAdditionalACLs(Archive *fout);
 static void dumpCommentExtended(Archive *fout, const char *type,
-								const char *name, const char *namespace,
+								const char *name, const NamespaceInfo *namespace,
 								const char *owner, CatalogId catalogId,
 								int subid, DumpId dumpId,
 								const char *initdb_comment);
 static inline void dumpComment(Archive *fout, const char *type,
-							   const char *name, const char *namespace,
+							   const char *name, const NamespaceInfo *namespace,
 							   const char *owner, CatalogId catalogId,
 							   int subid, DumpId dumpId);
 static int	findComments(Oid classoid, Oid objoid, CommentItem **items);
 static void collectComments(Archive *fout);
 static void dumpSecLabel(Archive *fout, const char *type, const char *name,
-						 const char *namespace, const char *owner,
+						 const NamespaceInfo *namespace, const char *owner,
 						 CatalogId catalogId, int subid, DumpId dumpId);
 static int	findSecLabels(Oid classoid, Oid objoid, SecLabelItem **items);
 static void collectSecLabels(Archive *fout);
@@ -257,13 +276,13 @@ static void dumpTSConfig(Archive *fout, const TSConfigInfo *cfginfo);
 static void dumpForeignDataWrapper(Archive *fout, const FdwInfo *fdwinfo);
 static void dumpForeignServer(Archive *fout, const ForeignServerInfo *srvinfo);
 static void dumpUserMappings(Archive *fout,
-							 const char *servername, const char *namespace,
+							 const char *servername, const NamespaceInfo *namespace,
 							 const char *owner, CatalogId catalogId, DumpId dumpId);
 static void dumpDefaultACL(Archive *fout, const DefaultACLInfo *daclinfo);
 
 static DumpId dumpACL(Archive *fout, DumpId objDumpId, DumpId altDumpId,
 					  const char *type, const char *name, const char *subname,
-					  const char *nspname, const char *owner,
+					  const NamespaceInfo *nsp, const char *owner,
 					  const DumpableAcl *dacl);
 
 static void getDependencies(Archive *fout);
@@ -433,6 +452,7 @@ main(int argc, char **argv)
 		{"exclude-table-and-children", required_argument, NULL, 13},
 		{"exclude-table-data-and-children", required_argument, NULL, 14},
 		{"restrict-key", required_argument, NULL, 25},
+		{"rename-schema", required_argument, NULL, 30},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -458,7 +478,7 @@ main(int argc, char **argv)
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_dump (PostgreSQL) " PG_VERSION);
+			puts("pg_dump (MyDataMove) " PG_VERSION);
 			exit_nicely(0);
 		}
 	}
@@ -663,6 +683,10 @@ main(int argc, char **argv)
 				dopt.restrict_key = pg_strdup(optarg);
 				break;
 
+			case 30:     /* replace schema(s) */
+				simple_string_list_append(&schema_replace_patterns, optarg);
+				break;
+
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -854,6 +878,14 @@ main(int argc, char **argv)
 								&schema_exclude_oids,
 								false);
 	/* non-matching exclusion patterns aren't an error */
+	
+	if (schema_replace_patterns.head != NULL)
+	{
+		expand_schema_replace_patterns(fout, &schema_replace_patterns,
+					&schema_replace_oids,
+					&schema_replacements,
+					strict_names);
+	}
 
 	/* Expand table selection patterns into OID lists */
 	expand_table_name_patterns(fout, &table_include_patterns,
@@ -961,6 +993,19 @@ main(int argc, char **argv)
 
 	/* Get pointers to all the known DumpableObjects */
 	getDumpableObjects(&dobjs, &numObjs);
+	
+	/* annotate any schema replacements */
+	for (i = 0; i < numObjs; i++) 
+	{
+		if(dobjs[i]->namespace && &dobjs[i]->namespace->dobj.catId) 
+		{
+			char *replacement = lookup_schema_replacment(&schema_replace_oids, &schema_replacements, dobjs[i]->namespace->dobj.catId.oid);
+			if(replacement) 
+			{
+				dobjs[i]->namespace->dobj.replacement_name = replacement;   
+			}
+		}
+	}
 
 	/*
 	 * Add dummy dependencies to enforce the dump section ordering.
@@ -1140,6 +1185,9 @@ help(const char *progname)
 	printf(_("  --no-unlogged-table-data     do not dump unlogged table data\n"));
 	printf(_("  --on-conflict-do-nothing     add ON CONFLICT DO NOTHING to INSERT commands\n"));
 	printf(_("  --quote-all-identifiers      quote all identifiers, even if not key words\n"));
+	printf(_("  --rename-schema=PATTERN:replacement\n"
+			 "                               replace schema(s) matching PATTERN with replacement\n"
+			 "                               schema name\n"));
 	printf(_("  --restrict-key=RESTRICT_KEY  use provided string as psql \\restrict key\n"));
 	printf(_("  --rows-per-insert=NROWS      number of rows per INSERT; implies --inserts\n"));
 	printf(_("  --section=SECTION            dump named section (pre-data, data, or post-data)\n"));
@@ -1456,6 +1504,93 @@ expand_schema_name_patterns(Archive *fout,
 	}
 
 	destroyPQExpBuffer(query);
+}
+
+
+static void
+expand_schema_replace_patterns(Archive *fout,
+				SimpleStringList *patterns,
+				SimpleOidList *oids,
+				SimpleStringList *replacements,
+				bool strict_names)
+{
+	PQExpBuffer query;
+	PGresult   *res;
+	SimpleStringListCell *cell;
+	int     i;
+
+	if (patterns->head == NULL)
+		return;         /* nothing to do */
+
+	query = createPQExpBuffer();
+
+  /*
+   * The loop below runs multiple SELECTs might sometimes result in
+   * duplicate entries in the OID list, but we don't care. We will just 
+   * use the first one
+   */
+
+	for (cell = patterns->head; cell; cell = cell->next)
+	{
+		PQExpBufferData dbbuf;
+		int     dotcnt;
+		
+		char* to_replace = strtok(cell->val, ":");
+		char* replace_with = strtok(NULL, ":");
+		
+		if (!replace_with) 
+		{
+			/* literal replace all */
+			replace_with = to_replace;
+			to_replace = "*";
+		}
+		
+		appendPQExpBufferStr(query,
+				"SELECT oid, oid::TEXT FROM pg_catalog.pg_namespace n\n");
+		initPQExpBuffer(&dbbuf);
+		processSQLNamePattern(GetConnection(fout), query, to_replace, false,
+				false, NULL, "n.nspname", NULL, NULL, &dbbuf,
+				&dotcnt);
+		if (dotcnt > 1)
+			pg_fatal("improper qualified name (too many dotted names): %s",
+				to_replace);
+		else if (dotcnt == 1)
+			prohibit_crossdb_refs(GetConnection(fout), dbbuf.data, to_replace);
+		termPQExpBuffer(&dbbuf);
+		
+		res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
+		if (strict_names && PQntuples(res) == 0)
+			pg_fatal("no matching schemas were found for pattern \"%s\"", to_replace);
+
+		for (i = 0; i < PQntuples(res); i++)
+		{
+			simple_oid_list_append(oids, atooid(PQgetvalue(res, i, 0)));
+			simple_string_list_append(replacements, replace_with);
+		}
+		
+		PQclear(res);
+		resetPQExpBuffer(query);
+	}
+	
+	destroyPQExpBuffer(query);
+}
+
+static char*
+lookup_schema_replacment(SimpleOidList *oids, SimpleStringList *replacements, Oid lookup)
+{
+	char *replacement = NULL;
+	SimpleOidListCell *oid;
+	SimpleStringListCell *repl;
+  
+	for (oid = oids->head, repl = replacements->head; oid; oid = oid->next, repl = repl->next) 
+	{
+		if(oid->val == lookup) 
+		{
+			replacement = repl->val;
+			break;
+		}
+	}
+	return replacement;
 }
 
 /*
@@ -2165,14 +2300,14 @@ dumpTableData_copy(Archive *fout, const void *dcontext)
 		else
 			appendPQExpBufferStr(q, "* ");
 
-		appendPQExpBuffer(q, "FROM %s %s) TO stdout;",
-						  fmtQualifiedDumpable(tbinfo),
+    appendPQExpBuffer(q, "FROM %s %s) TO stdout;",
+						  fmtQualifiedDumpableSrc(tbinfo),
 						  tdinfo->filtercond ? tdinfo->filtercond : "");
 	}
 	else
 	{
-		appendPQExpBuffer(q, "COPY %s %s TO stdout;",
-						  fmtQualifiedDumpable(tbinfo),
+    appendPQExpBuffer(q, "COPY %s %s TO stdout;",
+						  fmtQualifiedDumpableSrc(tbinfo),
 						  column_list);
 	}
 	res = ExecuteSqlQuery(fout, q->data, PGRES_COPY_OUT);
@@ -2330,7 +2465,7 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 	if (nfields == 0)
 		appendPQExpBufferStr(q, "NULL");
 	appendPQExpBuffer(q, " FROM ONLY %s",
-					  fmtQualifiedDumpable(tbinfo));
+					  fmtQualifiedDumpableSrc(tbinfo));
 	if (tdinfo->filtercond)
 		appendPQExpBuffer(q, " %s", tdinfo->filtercond);
 
@@ -2373,7 +2508,7 @@ dumpTableData_insert(Archive *fout, const void *dcontext)
 				targettab = tbinfo;
 
 			appendPQExpBuffer(insertStmt, "INSERT INTO %s ",
-							  fmtQualifiedDumpable(targettab));
+							  fmtQualifiedDumpableDest(targettab));
 
 			/* corner case for zero-column table */
 			if (nfields == 0)
@@ -2633,7 +2768,7 @@ dumpTableData(Archive *fout, const TableDataInfo *tdinfo)
 		char	   *sanitized;
 
 		parentTbinfo = getRootTableInfo(tbinfo);
-		copyFrom = fmtQualifiedDumpable(parentTbinfo);
+		copyFrom = fmtQualifiedDumpableDest(parentTbinfo);
 		sanitized = sanitize_line(copyFrom, true);
 		printfPQExpBuffer(copyBuf, "-- load via partition root %s",
 						  sanitized);
@@ -2641,7 +2776,7 @@ dumpTableData(Archive *fout, const TableDataInfo *tdinfo)
 		tdDefn = pg_strdup(copyBuf->data);
 	}
 	else
-		copyFrom = fmtQualifiedDumpable(tbinfo);
+		copyFrom = fmtQualifiedDumpableDest(tbinfo);
 
 	if (dopt->dump_inserts == 0)
 	{
@@ -2672,7 +2807,7 @@ dumpTableData(Archive *fout, const TableDataInfo *tdinfo)
 
 		te = ArchiveEntry(fout, tdinfo->dobj.catId, tdinfo->dobj.dumpId,
 						  ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
-									   .namespace = tbinfo->dobj.namespace->dobj.name,
+									   .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 									   .owner = tbinfo->rolname,
 									   .description = "TABLE DATA",
 									   .section = SECTION_DATA,
@@ -2732,14 +2867,14 @@ refreshMatViewData(Archive *fout, const TableDataInfo *tdinfo)
 	q = createPQExpBuffer();
 
 	appendPQExpBuffer(q, "REFRESH MATERIALIZED VIEW %s;\n",
-					  fmtQualifiedDumpable(tbinfo));
+					  fmtQualifiedDumpableDest(tbinfo));
 
 	if (tdinfo->dobj.dump & DUMP_COMPONENT_DATA)
 		ArchiveEntry(fout,
 					 tdinfo->dobj.catId,	/* catalog ID */
 					 tdinfo->dobj.dumpId,	/* dump ID */
 					 ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "MATERIALIZED VIEW DATA",
 								  .section = SECTION_POST_DATA,
@@ -4018,7 +4153,7 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 		query = createPQExpBuffer();
 
 		appendPQExpBuffer(query, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 
 		/*
 		 * We must emit the ROW SECURITY object's dependency on its table
@@ -4028,7 +4163,7 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 		if (polinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 			ArchiveEntry(fout, polinfo->dobj.catId, polinfo->dobj.dumpId,
 						 ARCHIVE_OPTS(.tag = polinfo->dobj.name,
-									  .namespace = polinfo->dobj.namespace->dobj.name,
+									  .namespace = getDestSchemaName(polinfo->dobj.namespace),
 									  .owner = tbinfo->rolname,
 									  .description = "ROW SECURITY",
 									  .section = SECTION_POST_DATA,
@@ -4062,7 +4197,7 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 
 	appendPQExpBuffer(query, "CREATE POLICY %s", fmtId(polinfo->polname));
 
-	appendPQExpBuffer(query, " ON %s%s%s", fmtQualifiedDumpable(tbinfo),
+	appendPQExpBuffer(query, " ON %s%s%s", fmtQualifiedDumpableDest(tbinfo),
 					  !polinfo->polpermissive ? " AS RESTRICTIVE" : "", cmd);
 
 	if (polinfo->polroles != NULL)
@@ -4077,7 +4212,7 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 	appendPQExpBufferStr(query, ";\n");
 
 	appendPQExpBuffer(delqry, "DROP POLICY %s", fmtId(polinfo->polname));
-	appendPQExpBuffer(delqry, " ON %s;\n", fmtQualifiedDumpable(tbinfo));
+	appendPQExpBuffer(delqry, " ON %s;\n", fmtQualifiedDumpableDest(tbinfo));
 
 	appendPQExpBuffer(polprefix, "POLICY %s ON",
 					  fmtId(polinfo->polname));
@@ -4087,7 +4222,7 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 	if (polinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, polinfo->dobj.catId, polinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tag,
-								  .namespace = polinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(polinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "POLICY",
 								  .section = SECTION_POST_DATA,
@@ -4096,7 +4231,7 @@ dumpPolicy(Archive *fout, const PolicyInfo *polinfo)
 
 	if (polinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, polprefix->data, qtabname,
-					tbinfo->dobj.namespace->dobj.name, tbinfo->rolname,
+					tbinfo->dobj.namespace, tbinfo->rolname,
 					polinfo->dobj.catId, 0, polinfo->dobj.dumpId);
 
 	free(tag);
@@ -4556,7 +4691,7 @@ dumpPublicationNamespace(Archive *fout, const PublicationSchemaInfo *pubsinfo)
 	if (pubsinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, pubsinfo->dobj.catId, pubsinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tag,
-								  .namespace = schemainfo->dobj.name,
+								  .namespace = getDestSchemaName(schemainfo),
 								  .owner = pubinfo->rolname,
 								  .description = "PUBLICATION TABLES IN SCHEMA",
 								  .section = SECTION_POST_DATA,
@@ -4592,7 +4727,7 @@ dumpPublicationTable(Archive *fout, const PublicationRelInfo *pubrinfo)
 	appendPQExpBuffer(query, "ALTER PUBLICATION %s ADD TABLE ONLY",
 					  fmtId(pubinfo->dobj.name));
 	appendPQExpBuffer(query, " %s",
-					  fmtQualifiedDumpable(tbinfo));
+					  fmtQualifiedDumpableDest(tbinfo));
 
 	if (pubrinfo->pubrattrs)
 		appendPQExpBuffer(query, " (%s)", pubrinfo->pubrattrs);
@@ -4618,7 +4753,7 @@ dumpPublicationTable(Archive *fout, const PublicationRelInfo *pubrinfo)
 	if (pubrinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, pubrinfo->dobj.catId, pubrinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tag,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = pubinfo->rolname,
 								  .description = "PUBLICATION TABLE",
 								  .section = SECTION_POST_DATA,
@@ -6850,11 +6985,11 @@ getTables(Archive *fout, int *numTables)
 			 */
 			if (query->len == 0)
 				appendPQExpBuffer(query, "LOCK TABLE %s",
-								  fmtQualifiedDumpable(&tblinfo[i]));
+								  fmtQualifiedDumpableSrc(&tblinfo[i]));
 			else
 			{
 				appendPQExpBuffer(query, ", %s",
-								  fmtQualifiedDumpable(&tblinfo[i]));
+								  fmtQualifiedDumpableSrc(&tblinfo[i]));
 
 				/* Arbitrarily end a batch when query length reaches 100K. */
 				if (query->len >= 100000)
@@ -9836,7 +9971,7 @@ getAdditionalACLs(Archive *fout)
  */
 static void
 dumpCommentExtended(Archive *fout, const char *type,
-					const char *name, const char *namespace,
+					const char *name, const NamespaceInfo *namespace,
 					const char *owner, CatalogId catalogId,
 					int subid, DumpId dumpId,
 					const char *initdb_comment)
@@ -9901,8 +10036,12 @@ dumpCommentExtended(Archive *fout, const char *type,
 		PQExpBuffer tag = createPQExpBuffer();
 
 		appendPQExpBuffer(query, "COMMENT ON %s ", type);
-		if (namespace && *namespace)
-			appendPQExpBuffer(query, "%s.", fmtId(namespace));
+		if (namespace) 
+		{
+			const char* dsn = getDestSchemaName(namespace);
+			if(*dsn) 
+				appendPQExpBuffer(query, "%s.", fmtId(dsn));
+		}
 		appendPQExpBuffer(query, "%s IS ", name);
 		appendStringLiteralAH(query, comments->descr, fout);
 		appendPQExpBufferStr(query, ";\n");
@@ -9916,7 +10055,7 @@ dumpCommentExtended(Archive *fout, const char *type,
 		 */
 		ArchiveEntry(fout, nilCatalogId, createDumpId(),
 					 ARCHIVE_OPTS(.tag = tag->data,
-								  .namespace = namespace,
+								  .namespace = namespace != NULL ? getDestSchemaName(namespace) : NULL,
 								  .owner = owner,
 								  .description = "COMMENT",
 								  .section = SECTION_NONE,
@@ -9936,7 +10075,7 @@ dumpCommentExtended(Archive *fout, const char *type,
  */
 static inline void
 dumpComment(Archive *fout, const char *type,
-			const char *name, const char *namespace,
+			const char *name, const NamespaceInfo *namespace,
 			const char *owner, CatalogId catalogId,
 			int subid, DumpId dumpId)
 {
@@ -9993,13 +10132,13 @@ dumpTableComment(Archive *fout, const TableInfo *tbinfo,
 
 			resetPQExpBuffer(query);
 			appendPQExpBuffer(query, "COMMENT ON %s %s IS ", reltypename,
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			appendStringLiteralAH(query, descr, fout);
 			appendPQExpBufferStr(query, ";\n");
 
 			ArchiveEntry(fout, nilCatalogId, createDumpId(),
 						 ARCHIVE_OPTS(.tag = tag->data,
-									  .namespace = tbinfo->dobj.namespace->dobj.name,
+									  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 									  .owner = tbinfo->rolname,
 									  .description = "COMMENT",
 									  .section = SECTION_NONE,
@@ -10016,7 +10155,7 @@ dumpTableComment(Archive *fout, const TableInfo *tbinfo,
 
 			resetPQExpBuffer(query);
 			appendPQExpBuffer(query, "COMMENT ON COLUMN %s.",
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			appendPQExpBuffer(query, "%s IS ",
 							  fmtId(tbinfo->attnames[objsubid - 1]));
 			appendStringLiteralAH(query, descr, fout);
@@ -10024,7 +10163,7 @@ dumpTableComment(Archive *fout, const TableInfo *tbinfo,
 
 			ArchiveEntry(fout, nilCatalogId, createDumpId(),
 						 ARCHIVE_OPTS(.tag = tag->data,
-									  .namespace = tbinfo->dobj.namespace->dobj.name,
+									  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 									  .owner = tbinfo->rolname,
 									  .description = "COMMENT",
 									  .section = SECTION_NONE,
@@ -10671,7 +10810,7 @@ dumpEnumType(Archive *fout, const TypeInfo *tyinfo)
 	num = PQntuples(res);
 
 	qtypname = pg_strdup(fmtId(tyinfo->dobj.name));
-	qualtypname = pg_strdup(fmtQualifiedDumpable(tyinfo));
+	qualtypname = pg_strdup(fmtQualifiedDumpableDest(tyinfo));
 
 	/*
 	 * CASCADE shouldn't be required here as for normal types since the I/O
@@ -10734,7 +10873,7 @@ dumpEnumType(Archive *fout, const TypeInfo *tyinfo)
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tyinfo->dobj.catId, tyinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tyinfo->dobj.name,
-								  .namespace = tyinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 								  .owner = tyinfo->rolname,
 								  .description = "TYPE",
 								  .section = SECTION_PRE_DATA,
@@ -10744,18 +10883,18 @@ dumpEnumType(Archive *fout, const TypeInfo *tyinfo)
 	/* Dump Type Comments and Security Labels */
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TYPE", qtypname,
-					tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					tyinfo->dobj.namespace, tyinfo->rolname,
 					tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "TYPE", qtypname,
-					 tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					 tyinfo->dobj.namespace, tyinfo->rolname,
 					 tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, tyinfo->dobj.dumpId, InvalidDumpId, "TYPE",
 				qtypname, NULL,
-				tyinfo->dobj.namespace->dobj.name,
+				tyinfo->dobj.namespace,
 				tyinfo->rolname, &tyinfo->dacl);
 
 	PQclear(res);
@@ -10825,7 +10964,7 @@ dumpRangeType(Archive *fout, const TypeInfo *tyinfo)
 	res = ExecuteSqlQueryForSingleRow(fout, query->data);
 
 	qtypname = pg_strdup(fmtId(tyinfo->dobj.name));
-	qualtypname = pg_strdup(fmtQualifiedDumpable(tyinfo));
+	qualtypname = pg_strdup(fmtQualifiedDumpableDest(tyinfo));
 
 	/*
 	 * CASCADE shouldn't be required here as for normal types since the I/O
@@ -10866,7 +11005,7 @@ dumpRangeType(Archive *fout, const TypeInfo *tyinfo)
 
 		if (coll)
 			appendPQExpBuffer(q, ",\n    collation = %s",
-							  fmtQualifiedDumpable(coll));
+							  fmtQualifiedDumpableDest(coll));
 	}
 
 	procname = PQgetvalue(res, 0, PQfnumber(res, "rngcanonical"));
@@ -10887,7 +11026,7 @@ dumpRangeType(Archive *fout, const TypeInfo *tyinfo)
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tyinfo->dobj.catId, tyinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tyinfo->dobj.name,
-								  .namespace = tyinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 								  .owner = tyinfo->rolname,
 								  .description = "TYPE",
 								  .section = SECTION_PRE_DATA,
@@ -10897,18 +11036,18 @@ dumpRangeType(Archive *fout, const TypeInfo *tyinfo)
 	/* Dump Type Comments and Security Labels */
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TYPE", qtypname,
-					tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					tyinfo->dobj.namespace, tyinfo->rolname,
 					tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "TYPE", qtypname,
-					 tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					 tyinfo->dobj.namespace, tyinfo->rolname,
 					 tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, tyinfo->dobj.dumpId, InvalidDumpId, "TYPE",
 				qtypname, NULL,
-				tyinfo->dobj.namespace->dobj.name,
+				tyinfo->dobj.namespace,
 				tyinfo->rolname, &tyinfo->dacl);
 
 	PQclear(res);
@@ -10938,7 +11077,7 @@ dumpUndefinedType(Archive *fout, const TypeInfo *tyinfo)
 	char	   *qualtypname;
 
 	qtypname = pg_strdup(fmtId(tyinfo->dobj.name));
-	qualtypname = pg_strdup(fmtQualifiedDumpable(tyinfo));
+	qualtypname = pg_strdup(fmtQualifiedDumpableDest(tyinfo));
 
 	appendPQExpBuffer(delq, "DROP TYPE %s;\n", qualtypname);
 
@@ -10958,7 +11097,7 @@ dumpUndefinedType(Archive *fout, const TypeInfo *tyinfo)
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tyinfo->dobj.catId, tyinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tyinfo->dobj.name,
-								  .namespace = tyinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 								  .owner = tyinfo->rolname,
 								  .description = "TYPE",
 								  .section = SECTION_PRE_DATA,
@@ -10968,18 +11107,18 @@ dumpUndefinedType(Archive *fout, const TypeInfo *tyinfo)
 	/* Dump Type Comments and Security Labels */
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TYPE", qtypname,
-					tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					tyinfo->dobj.namespace, tyinfo->rolname,
 					tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "TYPE", qtypname,
-					 tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					 tyinfo->dobj.namespace, tyinfo->rolname,
 					 tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, tyinfo->dobj.dumpId, InvalidDumpId, "TYPE",
 				qtypname, NULL,
-				tyinfo->dobj.namespace->dobj.name,
+				tyinfo->dobj.namespace,
 				tyinfo->rolname, &tyinfo->dacl);
 
 	destroyPQExpBuffer(q);
@@ -11101,7 +11240,7 @@ dumpBaseType(Archive *fout, const TypeInfo *tyinfo)
 		typdefault = NULL;
 
 	qtypname = pg_strdup(fmtId(tyinfo->dobj.name));
-	qualtypname = pg_strdup(fmtQualifiedDumpable(tyinfo));
+	qualtypname = pg_strdup(fmtQualifiedDumpableDest(tyinfo));
 
 	/*
 	 * The reason we include CASCADE is that the circular dependency between
@@ -11205,7 +11344,7 @@ dumpBaseType(Archive *fout, const TypeInfo *tyinfo)
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tyinfo->dobj.catId, tyinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tyinfo->dobj.name,
-								  .namespace = tyinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 								  .owner = tyinfo->rolname,
 								  .description = "TYPE",
 								  .section = SECTION_PRE_DATA,
@@ -11215,18 +11354,18 @@ dumpBaseType(Archive *fout, const TypeInfo *tyinfo)
 	/* Dump Type Comments and Security Labels */
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TYPE", qtypname,
-					tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					tyinfo->dobj.namespace, tyinfo->rolname,
 					tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "TYPE", qtypname,
-					 tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					 tyinfo->dobj.namespace, tyinfo->rolname,
 					 tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, tyinfo->dobj.dumpId, InvalidDumpId, "TYPE",
 				qtypname, NULL,
-				tyinfo->dobj.namespace->dobj.name,
+				tyinfo->dobj.namespace,
 				tyinfo->rolname, &tyinfo->dacl);
 
 	PQclear(res);
@@ -11305,7 +11444,7 @@ dumpDomain(Archive *fout, const TypeInfo *tyinfo)
 												 false);	/* force multirange type */
 
 	qtypname = pg_strdup(fmtId(tyinfo->dobj.name));
-	qualtypname = pg_strdup(fmtQualifiedDumpable(tyinfo));
+	qualtypname = pg_strdup(fmtQualifiedDumpableDest(tyinfo));
 
 	appendPQExpBuffer(q,
 					  "CREATE DOMAIN %s AS %s",
@@ -11319,7 +11458,7 @@ dumpDomain(Archive *fout, const TypeInfo *tyinfo)
 
 		coll = findCollationByOid(typcollation);
 		if (coll)
-			appendPQExpBuffer(q, " COLLATE %s", fmtQualifiedDumpable(coll));
+			appendPQExpBuffer(q, " COLLATE %s", fmtQualifiedDumpableDest(coll));
 	}
 
 	if (typnotnull[0] == 't')
@@ -11360,7 +11499,7 @@ dumpDomain(Archive *fout, const TypeInfo *tyinfo)
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tyinfo->dobj.catId, tyinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tyinfo->dobj.name,
-								  .namespace = tyinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 								  .owner = tyinfo->rolname,
 								  .description = "DOMAIN",
 								  .section = SECTION_PRE_DATA,
@@ -11370,18 +11509,18 @@ dumpDomain(Archive *fout, const TypeInfo *tyinfo)
 	/* Dump Domain Comments and Security Labels */
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "DOMAIN", qtypname,
-					tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					tyinfo->dobj.namespace, tyinfo->rolname,
 					tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "DOMAIN", qtypname,
-					 tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					 tyinfo->dobj.namespace, tyinfo->rolname,
 					 tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, tyinfo->dobj.dumpId, InvalidDumpId, "TYPE",
 				qtypname, NULL,
-				tyinfo->dobj.namespace->dobj.name,
+				tyinfo->dobj.namespace,
 				tyinfo->rolname, &tyinfo->dacl);
 
 	/* Dump any per-constraint comments */
@@ -11400,7 +11539,7 @@ dumpDomain(Archive *fout, const TypeInfo *tyinfo)
 
 		if (domcheck->dobj.dump & DUMP_COMPONENT_COMMENT)
 			dumpComment(fout, conprefix->data, qtypname,
-						tyinfo->dobj.namespace->dobj.name,
+						tyinfo->dobj.namespace,
 						tyinfo->rolname,
 						domcheck->dobj.catId, 0, tyinfo->dobj.dumpId);
 
@@ -11492,7 +11631,7 @@ dumpCompositeType(Archive *fout, const TypeInfo *tyinfo)
 	}
 
 	qtypname = pg_strdup(fmtId(tyinfo->dobj.name));
-	qualtypname = pg_strdup(fmtQualifiedDumpable(tyinfo));
+	qualtypname = pg_strdup(fmtQualifiedDumpableDest(tyinfo));
 
 	appendPQExpBuffer(q, "CREATE TYPE %s AS (",
 					  qualtypname);
@@ -11534,7 +11673,7 @@ dumpCompositeType(Archive *fout, const TypeInfo *tyinfo)
 				coll = findCollationByOid(attcollation);
 				if (coll)
 					appendPQExpBuffer(q, " COLLATE %s",
-									  fmtQualifiedDumpable(coll));
+									  fmtQualifiedDumpableDest(coll));
 			}
 		}
 		else
@@ -11578,7 +11717,7 @@ dumpCompositeType(Archive *fout, const TypeInfo *tyinfo)
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tyinfo->dobj.catId, tyinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tyinfo->dobj.name,
-								  .namespace = tyinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 								  .owner = tyinfo->rolname,
 								  .description = "TYPE",
 								  .section = SECTION_PRE_DATA,
@@ -11589,18 +11728,18 @@ dumpCompositeType(Archive *fout, const TypeInfo *tyinfo)
 	/* Dump Type Comments and Security Labels */
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TYPE", qtypname,
-					tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					tyinfo->dobj.namespace, tyinfo->rolname,
 					tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "TYPE", qtypname,
-					 tyinfo->dobj.namespace->dobj.name, tyinfo->rolname,
+					 tyinfo->dobj.namespace, tyinfo->rolname,
 					 tyinfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 
 	if (tyinfo->dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, tyinfo->dobj.dumpId, InvalidDumpId, "TYPE",
 				qtypname, NULL,
-				tyinfo->dobj.namespace->dobj.name,
+				tyinfo->dobj.namespace,
 				tyinfo->rolname, &tyinfo->dacl);
 
 	/* Dump any per-column comments */
@@ -11684,14 +11823,14 @@ dumpCompositeTypeColComments(Archive *fout, const TypeInfo *tyinfo,
 
 			resetPQExpBuffer(query);
 			appendPQExpBuffer(query, "COMMENT ON COLUMN %s.",
-							  fmtQualifiedDumpable(tyinfo));
+							  fmtQualifiedDumpableDest(tyinfo));
 			appendPQExpBuffer(query, "%s IS ", fmtId(attname));
 			appendStringLiteralAH(query, descr, fout);
 			appendPQExpBufferStr(query, ";\n");
 
 			ArchiveEntry(fout, nilCatalogId, createDumpId(),
 						 ARCHIVE_OPTS(.tag = target->data,
-									  .namespace = tyinfo->dobj.namespace->dobj.name,
+									  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 									  .owner = tyinfo->rolname,
 									  .description = "COMMENT",
 									  .section = SECTION_NONE,
@@ -11741,12 +11880,12 @@ dumpShellType(Archive *fout, const ShellTypeInfo *stinfo)
 												 false, false);
 
 	appendPQExpBuffer(q, "CREATE TYPE %s;\n",
-					  fmtQualifiedDumpable(stinfo));
+					  fmtQualifiedDumpableDest(stinfo));
 
 	if (stinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, stinfo->dobj.catId, stinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = stinfo->dobj.name,
-								  .namespace = stinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(stinfo->dobj.namespace),
 								  .owner = stinfo->baseType->rolname,
 								  .description = "SHELL TYPE",
 								  .section = SECTION_PRE_DATA,
@@ -11825,13 +11964,13 @@ dumpProcLang(Archive *fout, const ProcLangInfo *plang)
 						  plang->lanpltrusted ? "TRUSTED " : "",
 						  qlanname);
 		appendPQExpBuffer(defqry, " HANDLER %s",
-						  fmtQualifiedDumpable(funcInfo));
+						  fmtQualifiedDumpableDest(funcInfo));
 		if (OidIsValid(plang->laninline))
 			appendPQExpBuffer(defqry, " INLINE %s",
-							  fmtQualifiedDumpable(inlineInfo));
+							  fmtQualifiedDumpableDest(inlineInfo));
 		if (OidIsValid(plang->lanvalidator))
 			appendPQExpBuffer(defqry, " VALIDATOR %s",
-							  fmtQualifiedDumpable(validatorInfo));
+							  fmtQualifiedDumpableDest(validatorInfo));
 	}
 	else
 	{
@@ -12318,7 +12457,7 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 	if (finfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, finfo->dobj.catId, finfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = funcsig_tag,
-								  .namespace = finfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(finfo->dobj.namespace),
 								  .owner = finfo->rolname,
 								  .description = keyword,
 								  .section = finfo->postponed_def ?
@@ -12329,18 +12468,18 @@ dumpFunc(Archive *fout, const FuncInfo *finfo)
 	/* Dump Function Comments and Security Labels */
 	if (finfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, keyword, funcsig,
-					finfo->dobj.namespace->dobj.name, finfo->rolname,
+					finfo->dobj.namespace, finfo->rolname,
 					finfo->dobj.catId, 0, finfo->dobj.dumpId);
 
 	if (finfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, keyword, funcsig,
-					 finfo->dobj.namespace->dobj.name, finfo->rolname,
+					 finfo->dobj.namespace, finfo->rolname,
 					 finfo->dobj.catId, 0, finfo->dobj.dumpId);
 
 	if (finfo->dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, finfo->dobj.dumpId, InvalidDumpId, keyword,
 				funcsig, NULL,
-				finfo->dobj.namespace->dobj.name,
+				finfo->dobj.namespace,
 				finfo->rolname, &finfo->dacl);
 
 	PQclear(res);
@@ -12782,7 +12921,7 @@ dumpOpr(Archive *fout, const OprInfo *oprinfo)
 	if (oprinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, oprinfo->dobj.catId, oprinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = oprinfo->dobj.name,
-								  .namespace = oprinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(oprinfo->dobj.namespace),
 								  .owner = oprinfo->rolname,
 								  .description = "OPERATOR",
 								  .section = SECTION_PRE_DATA,
@@ -12792,7 +12931,7 @@ dumpOpr(Archive *fout, const OprInfo *oprinfo)
 	/* Dump Operator Comments */
 	if (oprinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "OPERATOR", oprid->data,
-					oprinfo->dobj.namespace->dobj.name, oprinfo->rolname,
+					oprinfo->dobj.namespace, oprinfo->rolname,
 					oprinfo->dobj.catId, 0, oprinfo->dobj.dumpId);
 
 	PQclear(res);
@@ -13061,13 +13200,13 @@ dumpOpclass(Archive *fout, const OpclassInfo *opcinfo)
 	amname = pg_strdup(PQgetvalue(res, 0, i_amname));
 
 	appendPQExpBuffer(delq, "DROP OPERATOR CLASS %s",
-					  fmtQualifiedDumpable(opcinfo));
+					  fmtQualifiedDumpableDest(opcinfo));
 	appendPQExpBuffer(delq, " USING %s;\n",
 					  fmtId(amname));
 
 	/* Build the fixed portion of the CREATE command */
 	appendPQExpBuffer(q, "CREATE OPERATOR CLASS %s\n    ",
-					  fmtQualifiedDumpable(opcinfo));
+					  fmtQualifiedDumpableDest(opcinfo));
 	if (strcmp(opcdefault, "t") == 0)
 		appendPQExpBufferStr(q, "DEFAULT ");
 	appendPQExpBuffer(q, "FOR TYPE %s USING %s",
@@ -13226,7 +13365,7 @@ dumpOpclass(Archive *fout, const OpclassInfo *opcinfo)
 	if (opcinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, opcinfo->dobj.catId, opcinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = opcinfo->dobj.name,
-								  .namespace = opcinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(opcinfo->dobj.namespace),
 								  .owner = opcinfo->rolname,
 								  .description = "OPERATOR CLASS",
 								  .section = SECTION_PRE_DATA,
@@ -13236,7 +13375,7 @@ dumpOpclass(Archive *fout, const OpclassInfo *opcinfo)
 	/* Dump Operator Class Comments */
 	if (opcinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "OPERATOR CLASS", nameusing->data,
-					opcinfo->dobj.namespace->dobj.name, opcinfo->rolname,
+					opcinfo->dobj.namespace, opcinfo->rolname,
 					opcinfo->dobj.catId, 0, opcinfo->dobj.dumpId);
 
 	free(opcintype);
@@ -13351,13 +13490,13 @@ dumpOpfamily(Archive *fout, const OpfamilyInfo *opfinfo)
 	amname = pg_strdup(PQgetvalue(res, 0, i_amname));
 
 	appendPQExpBuffer(delq, "DROP OPERATOR FAMILY %s",
-					  fmtQualifiedDumpable(opfinfo));
+					  fmtQualifiedDumpableDest(opfinfo));
 	appendPQExpBuffer(delq, " USING %s;\n",
 					  fmtId(amname));
 
 	/* Build the fixed portion of the CREATE command */
 	appendPQExpBuffer(q, "CREATE OPERATOR FAMILY %s",
-					  fmtQualifiedDumpable(opfinfo));
+					  fmtQualifiedDumpableDest(opfinfo));
 	appendPQExpBuffer(q, " USING %s;\n",
 					  fmtId(amname));
 
@@ -13367,7 +13506,7 @@ dumpOpfamily(Archive *fout, const OpfamilyInfo *opfinfo)
 	if (PQntuples(res_ops) > 0 || PQntuples(res_procs) > 0)
 	{
 		appendPQExpBuffer(q, "ALTER OPERATOR FAMILY %s",
-						  fmtQualifiedDumpable(opfinfo));
+						  fmtQualifiedDumpableDest(opfinfo));
 		appendPQExpBuffer(q, " USING %s ADD\n    ",
 						  fmtId(amname));
 
@@ -13448,7 +13587,7 @@ dumpOpfamily(Archive *fout, const OpfamilyInfo *opfinfo)
 	if (opfinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, opfinfo->dobj.catId, opfinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = opfinfo->dobj.name,
-								  .namespace = opfinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(opfinfo->dobj.namespace),
 								  .owner = opfinfo->rolname,
 								  .description = "OPERATOR FAMILY",
 								  .section = SECTION_PRE_DATA,
@@ -13458,7 +13597,7 @@ dumpOpfamily(Archive *fout, const OpfamilyInfo *opfinfo)
 	/* Dump Operator Family Comments */
 	if (opfinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "OPERATOR FAMILY", nameusing->data,
-					opfinfo->dobj.namespace->dobj.name, opfinfo->rolname,
+					opfinfo->dobj.namespace, opfinfo->rolname,
 					opfinfo->dobj.catId, 0, opfinfo->dobj.dumpId);
 
 	free(amname);
@@ -13589,10 +13728,10 @@ dumpCollation(Archive *fout, const CollInfo *collinfo)
 		collicurules = NULL;
 
 	appendPQExpBuffer(delq, "DROP COLLATION %s;\n",
-					  fmtQualifiedDumpable(collinfo));
+					  fmtQualifiedDumpableDest(collinfo));
 
 	appendPQExpBuffer(q, "CREATE COLLATION %s (",
-					  fmtQualifiedDumpable(collinfo));
+					  fmtQualifiedDumpableDest(collinfo));
 
 	appendPQExpBufferStr(q, "provider = ");
 	if (collprovider[0] == 'c')
@@ -13692,7 +13831,7 @@ dumpCollation(Archive *fout, const CollInfo *collinfo)
 	if (collinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, collinfo->dobj.catId, collinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = collinfo->dobj.name,
-								  .namespace = collinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(collinfo->dobj.namespace),
 								  .owner = collinfo->rolname,
 								  .description = "COLLATION",
 								  .section = SECTION_PRE_DATA,
@@ -13702,7 +13841,7 @@ dumpCollation(Archive *fout, const CollInfo *collinfo)
 	/* Dump Collation Comments */
 	if (collinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "COLLATION", qcollname,
-					collinfo->dobj.namespace->dobj.name, collinfo->rolname,
+					collinfo->dobj.namespace, collinfo->rolname,
 					collinfo->dobj.catId, 0, collinfo->dobj.dumpId);
 
 	PQclear(res);
@@ -13767,11 +13906,11 @@ dumpConversion(Archive *fout, const ConvInfo *convinfo)
 	condefault = (PQgetvalue(res, 0, i_condefault)[0] == 't');
 
 	appendPQExpBuffer(delq, "DROP CONVERSION %s;\n",
-					  fmtQualifiedDumpable(convinfo));
+					  fmtQualifiedDumpableDest(convinfo));
 
 	appendPQExpBuffer(q, "CREATE %sCONVERSION %s FOR ",
 					  (condefault) ? "DEFAULT " : "",
-					  fmtQualifiedDumpable(convinfo));
+					  fmtQualifiedDumpableDest(convinfo));
 	appendStringLiteralAH(q, conforencoding, fout);
 	appendPQExpBufferStr(q, " TO ");
 	appendStringLiteralAH(q, contoencoding, fout);
@@ -13786,7 +13925,7 @@ dumpConversion(Archive *fout, const ConvInfo *convinfo)
 	if (convinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, convinfo->dobj.catId, convinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = convinfo->dobj.name,
-								  .namespace = convinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(convinfo->dobj.namespace),
 								  .owner = convinfo->rolname,
 								  .description = "CONVERSION",
 								  .section = SECTION_PRE_DATA,
@@ -13796,7 +13935,7 @@ dumpConversion(Archive *fout, const ConvInfo *convinfo)
 	/* Dump Conversion Comments */
 	if (convinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "CONVERSION", qconvname,
-					convinfo->dobj.namespace->dobj.name, convinfo->rolname,
+					convinfo->dobj.namespace, convinfo->rolname,
 					convinfo->dobj.catId, 0, convinfo->dobj.dumpId);
 
 	PQclear(res);
@@ -14154,7 +14293,7 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 		ArchiveEntry(fout, agginfo->aggfn.dobj.catId,
 					 agginfo->aggfn.dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = aggsig_tag,
-								  .namespace = agginfo->aggfn.dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(agginfo->aggfn.dobj.namespace),
 								  .owner = agginfo->aggfn.rolname,
 								  .description = "AGGREGATE",
 								  .section = SECTION_PRE_DATA,
@@ -14164,13 +14303,13 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 	/* Dump Aggregate Comments */
 	if (agginfo->aggfn.dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "AGGREGATE", aggsig,
-					agginfo->aggfn.dobj.namespace->dobj.name,
+					agginfo->aggfn.dobj.namespace,
 					agginfo->aggfn.rolname,
 					agginfo->aggfn.dobj.catId, 0, agginfo->aggfn.dobj.dumpId);
 
 	if (agginfo->aggfn.dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "AGGREGATE", aggsig,
-					 agginfo->aggfn.dobj.namespace->dobj.name,
+					 agginfo->aggfn.dobj.namespace,
 					 agginfo->aggfn.rolname,
 					 agginfo->aggfn.dobj.catId, 0, agginfo->aggfn.dobj.dumpId);
 
@@ -14186,7 +14325,7 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 	if (agginfo->aggfn.dobj.dump & DUMP_COMPONENT_ACL)
 		dumpACL(fout, agginfo->aggfn.dobj.dumpId, InvalidDumpId,
 				"FUNCTION", aggsig, NULL,
-				agginfo->aggfn.dobj.namespace->dobj.name,
+				agginfo->aggfn.dobj.namespace,
 				agginfo->aggfn.rolname, &agginfo->aggfn.dacl);
 
 	free(aggsig);
@@ -14223,7 +14362,7 @@ dumpTSParser(Archive *fout, const TSParserInfo *prsinfo)
 	qprsname = pg_strdup(fmtId(prsinfo->dobj.name));
 
 	appendPQExpBuffer(q, "CREATE TEXT SEARCH PARSER %s (\n",
-					  fmtQualifiedDumpable(prsinfo));
+					  fmtQualifiedDumpableDest(prsinfo));
 
 	appendPQExpBuffer(q, "    START = %s,\n",
 					  convertTSFunction(fout, prsinfo->prsstart));
@@ -14238,7 +14377,7 @@ dumpTSParser(Archive *fout, const TSParserInfo *prsinfo)
 					  convertTSFunction(fout, prsinfo->prslextype));
 
 	appendPQExpBuffer(delq, "DROP TEXT SEARCH PARSER %s;\n",
-					  fmtQualifiedDumpable(prsinfo));
+					  fmtQualifiedDumpableDest(prsinfo));
 
 	if (dopt->binary_upgrade)
 		binary_upgrade_extension_member(q, &prsinfo->dobj,
@@ -14248,7 +14387,7 @@ dumpTSParser(Archive *fout, const TSParserInfo *prsinfo)
 	if (prsinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, prsinfo->dobj.catId, prsinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = prsinfo->dobj.name,
-								  .namespace = prsinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(prsinfo->dobj.namespace),
 								  .description = "TEXT SEARCH PARSER",
 								  .section = SECTION_PRE_DATA,
 								  .createStmt = q->data,
@@ -14257,7 +14396,7 @@ dumpTSParser(Archive *fout, const TSParserInfo *prsinfo)
 	/* Dump Parser Comments */
 	if (prsinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TEXT SEARCH PARSER", qprsname,
-					prsinfo->dobj.namespace->dobj.name, "",
+					prsinfo->dobj.namespace, "",
 					prsinfo->dobj.catId, 0, prsinfo->dobj.dumpId);
 
 	destroyPQExpBuffer(q);
@@ -14301,7 +14440,7 @@ dumpTSDictionary(Archive *fout, const TSDictInfo *dictinfo)
 	tmplname = PQgetvalue(res, 0, 1);
 
 	appendPQExpBuffer(q, "CREATE TEXT SEARCH DICTIONARY %s (\n",
-					  fmtQualifiedDumpable(dictinfo));
+					  fmtQualifiedDumpableDest(dictinfo));
 
 	appendPQExpBufferStr(q, "    TEMPLATE = ");
 	appendPQExpBuffer(q, "%s.", fmtId(nspname));
@@ -14316,7 +14455,7 @@ dumpTSDictionary(Archive *fout, const TSDictInfo *dictinfo)
 	appendPQExpBufferStr(q, " );\n");
 
 	appendPQExpBuffer(delq, "DROP TEXT SEARCH DICTIONARY %s;\n",
-					  fmtQualifiedDumpable(dictinfo));
+					  fmtQualifiedDumpableDest(dictinfo));
 
 	if (dopt->binary_upgrade)
 		binary_upgrade_extension_member(q, &dictinfo->dobj,
@@ -14326,7 +14465,7 @@ dumpTSDictionary(Archive *fout, const TSDictInfo *dictinfo)
 	if (dictinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, dictinfo->dobj.catId, dictinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = dictinfo->dobj.name,
-								  .namespace = dictinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(dictinfo->dobj.namespace),
 								  .owner = dictinfo->rolname,
 								  .description = "TEXT SEARCH DICTIONARY",
 								  .section = SECTION_PRE_DATA,
@@ -14336,7 +14475,7 @@ dumpTSDictionary(Archive *fout, const TSDictInfo *dictinfo)
 	/* Dump Dictionary Comments */
 	if (dictinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TEXT SEARCH DICTIONARY", qdictname,
-					dictinfo->dobj.namespace->dobj.name, dictinfo->rolname,
+					dictinfo->dobj.namespace, dictinfo->rolname,
 					dictinfo->dobj.catId, 0, dictinfo->dobj.dumpId);
 
 	destroyPQExpBuffer(q);
@@ -14367,7 +14506,7 @@ dumpTSTemplate(Archive *fout, const TSTemplateInfo *tmplinfo)
 	qtmplname = pg_strdup(fmtId(tmplinfo->dobj.name));
 
 	appendPQExpBuffer(q, "CREATE TEXT SEARCH TEMPLATE %s (\n",
-					  fmtQualifiedDumpable(tmplinfo));
+					  fmtQualifiedDumpableDest(tmplinfo));
 
 	if (tmplinfo->tmplinit != InvalidOid)
 		appendPQExpBuffer(q, "    INIT = %s,\n",
@@ -14376,7 +14515,7 @@ dumpTSTemplate(Archive *fout, const TSTemplateInfo *tmplinfo)
 					  convertTSFunction(fout, tmplinfo->tmpllexize));
 
 	appendPQExpBuffer(delq, "DROP TEXT SEARCH TEMPLATE %s;\n",
-					  fmtQualifiedDumpable(tmplinfo));
+					  fmtQualifiedDumpableDest(tmplinfo));
 
 	if (dopt->binary_upgrade)
 		binary_upgrade_extension_member(q, &tmplinfo->dobj,
@@ -14386,7 +14525,7 @@ dumpTSTemplate(Archive *fout, const TSTemplateInfo *tmplinfo)
 	if (tmplinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tmplinfo->dobj.catId, tmplinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tmplinfo->dobj.name,
-								  .namespace = tmplinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tmplinfo->dobj.namespace),
 								  .description = "TEXT SEARCH TEMPLATE",
 								  .section = SECTION_PRE_DATA,
 								  .createStmt = q->data,
@@ -14395,7 +14534,7 @@ dumpTSTemplate(Archive *fout, const TSTemplateInfo *tmplinfo)
 	/* Dump Template Comments */
 	if (tmplinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TEXT SEARCH TEMPLATE", qtmplname,
-					tmplinfo->dobj.namespace->dobj.name, "",
+					tmplinfo->dobj.namespace, "",
 					tmplinfo->dobj.catId, 0, tmplinfo->dobj.dumpId);
 
 	destroyPQExpBuffer(q);
@@ -14443,7 +14582,7 @@ dumpTSConfig(Archive *fout, const TSConfigInfo *cfginfo)
 	prsname = PQgetvalue(res, 0, 1);
 
 	appendPQExpBuffer(q, "CREATE TEXT SEARCH CONFIGURATION %s (\n",
-					  fmtQualifiedDumpable(cfginfo));
+					  fmtQualifiedDumpableDest(cfginfo));
 
 	appendPQExpBuffer(q, "    PARSER = %s.", fmtId(nspname));
 	appendPQExpBuffer(q, "%s );\n", fmtId(prsname));
@@ -14479,7 +14618,7 @@ dumpTSConfig(Archive *fout, const TSConfigInfo *cfginfo)
 			if (i > 0)
 				appendPQExpBufferStr(q, ";\n");
 			appendPQExpBuffer(q, "\nALTER TEXT SEARCH CONFIGURATION %s\n",
-							  fmtQualifiedDumpable(cfginfo));
+							  fmtQualifiedDumpableDest(cfginfo));
 			/* tokenname needs quoting, dictname does NOT */
 			appendPQExpBuffer(q, "    ADD MAPPING FOR %s WITH %s",
 							  fmtId(tokenname), dictname);
@@ -14494,7 +14633,7 @@ dumpTSConfig(Archive *fout, const TSConfigInfo *cfginfo)
 	PQclear(res);
 
 	appendPQExpBuffer(delq, "DROP TEXT SEARCH CONFIGURATION %s;\n",
-					  fmtQualifiedDumpable(cfginfo));
+					  fmtQualifiedDumpableDest(cfginfo));
 
 	if (dopt->binary_upgrade)
 		binary_upgrade_extension_member(q, &cfginfo->dobj,
@@ -14504,7 +14643,7 @@ dumpTSConfig(Archive *fout, const TSConfigInfo *cfginfo)
 	if (cfginfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, cfginfo->dobj.catId, cfginfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = cfginfo->dobj.name,
-								  .namespace = cfginfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(cfginfo->dobj.namespace),
 								  .owner = cfginfo->rolname,
 								  .description = "TEXT SEARCH CONFIGURATION",
 								  .section = SECTION_PRE_DATA,
@@ -14514,7 +14653,7 @@ dumpTSConfig(Archive *fout, const TSConfigInfo *cfginfo)
 	/* Dump Configuration Comments */
 	if (cfginfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "TEXT SEARCH CONFIGURATION", qcfgname,
-					cfginfo->dobj.namespace->dobj.name, cfginfo->rolname,
+					cfginfo->dobj.namespace, cfginfo->rolname,
 					cfginfo->dobj.catId, 0, cfginfo->dobj.dumpId);
 
 	destroyPQExpBuffer(q);
@@ -14699,7 +14838,7 @@ dumpForeignServer(Archive *fout, const ForeignServerInfo *srvinfo)
  */
 static void
 dumpUserMappings(Archive *fout,
-				 const char *servername, const char *namespace,
+				 const char *servername, const NamespaceInfo *namespace,
 				 const char *owner,
 				 CatalogId catalogId, DumpId dumpId)
 {
@@ -14772,7 +14911,7 @@ dumpUserMappings(Archive *fout,
 
 		ArchiveEntry(fout, nilCatalogId, createDumpId(),
 					 ARCHIVE_OPTS(.tag = tag->data,
-								  .namespace = namespace,
+								  .namespace = namespace ? getDestSchemaName(namespace) : NULL,
 								  .owner = owner,
 								  .description = "USER MAPPING",
 								  .section = SECTION_PRE_DATA,
@@ -14848,7 +14987,7 @@ dumpDefaultACL(Archive *fout, const DefaultACLInfo *daclinfo)
 		ArchiveEntry(fout, daclinfo->dobj.catId, daclinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tag->data,
 								  .namespace = daclinfo->dobj.namespace ?
-								  daclinfo->dobj.namespace->dobj.name : NULL,
+								  getDestSchemaName(daclinfo->dobj.namespace) : NULL,
 								  .owner = daclinfo->defaclrole,
 								  .description = "DEFAULT ACL",
 								  .section = SECTION_POST_DATA,
@@ -14881,7 +15020,7 @@ dumpDefaultACL(Archive *fout, const DefaultACLInfo *daclinfo)
 static DumpId
 dumpACL(Archive *fout, DumpId objDumpId, DumpId altDumpId,
 		const char *type, const char *name, const char *subname,
-		const char *nspname, const char *owner,
+		const NamespaceInfo *nsp, const char *owner,
 		const DumpableAcl *dacl)
 {
 	DumpId		aclDumpId = InvalidDumpId;
@@ -14920,7 +15059,7 @@ dumpACL(Archive *fout, DumpId objDumpId, DumpId altDumpId,
 		initprivs && *initprivs != '\0')
 	{
 		appendPQExpBufferStr(sql, "SELECT pg_catalog.binary_upgrade_set_record_init_privs(true);\n");
-		if (!buildACLCommands(name, subname, nspname, type,
+		if (!buildACLCommands(name, subname, nsp ? getDestSchemaName(nsp) : NULL, type,
 							  initprivs, acldefault, owner,
 							  "", fout->remoteVersion, sql))
 			pg_fatal("could not parse initial ACL list (%s) or default (%s) for object \"%s\" (%s)",
@@ -14945,7 +15084,7 @@ dumpACL(Archive *fout, DumpId objDumpId, DumpId altDumpId,
 	else
 		baseacls = acldefault;
 
-	if (!buildACLCommands(name, subname, nspname, type,
+	if (!buildACLCommands(name, subname, nsp ? getDestSchemaName(nsp) : NULL, type,
 						  acls, baseacls, owner,
 						  "", fout->remoteVersion, sql))
 		pg_fatal("could not parse ACL list (%s) or default (%s) for object \"%s\" (%s)",
@@ -14970,7 +15109,7 @@ dumpACL(Archive *fout, DumpId objDumpId, DumpId altDumpId,
 
 		ArchiveEntry(fout, nilCatalogId, aclDumpId,
 					 ARCHIVE_OPTS(.tag = tag->data,
-								  .namespace = nspname,
+								  .namespace = nsp ? getDestSchemaName(nsp) : NULL,
 								  .owner = owner,
 								  .description = "ACL",
 								  .section = SECTION_NONE,
@@ -15006,7 +15145,7 @@ dumpACL(Archive *fout, DumpId objDumpId, DumpId altDumpId,
  */
 static void
 dumpSecLabel(Archive *fout, const char *type, const char *name,
-			 const char *namespace, const char *owner,
+			 const NamespaceInfo *namespace, const char *owner,
 			 CatalogId catalogId, int subid, DumpId dumpId)
 {
 	DumpOptions *dopt = fout->dopt;
@@ -15051,8 +15190,12 @@ dumpSecLabel(Archive *fout, const char *type, const char *name,
 		appendPQExpBuffer(query,
 						  "SECURITY LABEL FOR %s ON %s ",
 						  fmtId(labels[i].provider), type);
-		if (namespace && *namespace)
-			appendPQExpBuffer(query, "%s.", fmtId(namespace));
+		if (namespace) 
+		{
+			const char* dsn = getDestSchemaName(namespace);
+			if(*dsn)
+				appendPQExpBuffer(query, "%s.", fmtId(dsn));
+		}
 		appendPQExpBuffer(query, "%s IS ", name);
 		appendStringLiteralAH(query, labels[i].label, fout);
 		appendPQExpBufferStr(query, ";\n");
@@ -15065,7 +15208,7 @@ dumpSecLabel(Archive *fout, const char *type, const char *name,
 		appendPQExpBuffer(tag, "%s %s", type, name);
 		ArchiveEntry(fout, nilCatalogId, createDumpId(),
 					 ARCHIVE_OPTS(.tag = tag->data,
-								  .namespace = namespace,
+								  .namespace = namespace ? getDestSchemaName(namespace) : NULL,
 								  .owner = owner,
 								  .description = "SECURITY LABEL",
 								  .section = SECTION_NONE,
@@ -15125,14 +15268,14 @@ dumpTableSecLabel(Archive *fout, const TableInfo *tbinfo, const char *reltypenam
 		if (objsubid == 0)
 		{
 			appendPQExpBuffer(target, "%s %s", reltypename,
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 		}
 		else
 		{
 			colname = getAttrName(objsubid, tbinfo);
 			/* first fmtXXX result must be consumed before calling again */
 			appendPQExpBuffer(target, "COLUMN %s",
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			appendPQExpBuffer(target, ".%s", fmtId(colname));
 		}
 		appendPQExpBuffer(query, "SECURITY LABEL FOR %s ON %s IS ",
@@ -15147,7 +15290,7 @@ dumpTableSecLabel(Archive *fout, const TableInfo *tbinfo, const char *reltypenam
 						  fmtId(tbinfo->dobj.name));
 		ArchiveEntry(fout, nilCatalogId, createDumpId(),
 					 ARCHIVE_OPTS(.tag = target->data,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "SECURITY LABEL",
 								  .section = SECTION_NONE,
@@ -15360,7 +15503,7 @@ dumpTable(Archive *fout, const TableInfo *tbinfo)
 		tableAclDumpId =
 			dumpACL(fout, tbinfo->dobj.dumpId, InvalidDumpId,
 					objtype, namecopy, NULL,
-					tbinfo->dobj.namespace->dobj.name, tbinfo->rolname,
+					tbinfo->dobj.namespace, tbinfo->rolname,
 					&tbinfo->dacl);
 	}
 
@@ -15454,7 +15597,7 @@ dumpTable(Archive *fout, const TableInfo *tbinfo)
 			 */
 			dumpACL(fout, tbinfo->dobj.dumpId, tableAclDumpId,
 					"TABLE", namecopy, attnamecopy,
-					tbinfo->dobj.namespace->dobj.name, tbinfo->rolname,
+					tbinfo->dobj.namespace, tbinfo->rolname,
 					&coldacl);
 			free(attnamecopy);
 		}
@@ -15547,7 +15690,7 @@ createDummyViewAsClause(Archive *fout, const TableInfo *tbinfo)
 			coll = findCollationByOid(tbinfo->attcollation[j]);
 			if (coll)
 				appendPQExpBuffer(result, " COLLATE %s",
-								  fmtQualifiedDumpable(coll));
+								  fmtQualifiedDumpableDest(coll));
 		}
 
 		appendPQExpBuffer(result, " AS %s", fmtId(tbinfo->attnames[j]));
@@ -15580,7 +15723,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 	Assert(tbinfo->interesting);
 
 	qrelname = pg_strdup(fmtId(tbinfo->dobj.name));
-	qualrelname = pg_strdup(fmtQualifiedDumpable(tbinfo));
+	qualrelname = pg_strdup(fmtQualifiedDumpableDest(tbinfo));
 
 	if (tbinfo->hasoids)
 		pg_log_warning("WITH OIDS is not supported anymore (table \"%s\")",
@@ -15823,7 +15966,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 						coll = findCollationByOid(tbinfo->attcollation[j]);
 						if (coll)
 							appendPQExpBuffer(q, " COLLATE %s",
-											  fmtQualifiedDumpable(coll));
+											  fmtQualifiedDumpableDest(coll));
 					}
 				}
 			}
@@ -15881,7 +16024,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 
 					if (k > 0)
 						appendPQExpBufferStr(q, ", ");
-					appendPQExpBufferStr(q, fmtQualifiedDumpable(parentRel));
+					appendPQExpBufferStr(q, fmtQualifiedDumpableDest(parentRel));
 				}
 				appendPQExpBufferChar(q, ')');
 			}
@@ -16065,7 +16208,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 
 					appendPQExpBuffer(q, "ALTER %sTABLE ONLY %s INHERIT %s;\n", foreign,
 									  qualrelname,
-									  fmtQualifiedDumpable(parentRel));
+									  fmtQualifiedDumpableDest(parentRel));
 				}
 			}
 
@@ -16306,7 +16449,7 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 
 		ArchiveEntry(fout, tbinfo->dobj.catId, tbinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .tablespace = tablespace,
 								  .tableam = tableam,
 								  .owner = tbinfo->rolname,
@@ -16398,10 +16541,10 @@ dumpTableAttach(Archive *fout, const TableAttachInfo *attachinfo)
 	/* Perform ALTER TABLE on the parent */
 	printfPQExpBuffer(q,
 					  "ALTER TABLE ONLY %s ",
-					  fmtQualifiedDumpable(attachinfo->parentTbl));
+					  fmtQualifiedDumpableDest(attachinfo->parentTbl));
 	appendPQExpBuffer(q,
 					  "ATTACH PARTITION %s %s;\n",
-					  fmtQualifiedDumpable(attachinfo->partitionTbl),
+					  fmtQualifiedDumpableDest(attachinfo->partitionTbl),
 					  partbound);
 
 	/*
@@ -16413,7 +16556,7 @@ dumpTableAttach(Archive *fout, const TableAttachInfo *attachinfo)
 	 */
 	ArchiveEntry(fout, attachinfo->dobj.catId, attachinfo->dobj.dumpId,
 				 ARCHIVE_OPTS(.tag = attachinfo->dobj.name,
-							  .namespace = attachinfo->dobj.namespace->dobj.name,
+							  .namespace = getDestSchemaName(attachinfo->dobj.namespace),
 							  .owner = attachinfo->partitionTbl->rolname,
 							  .description = "TABLE ATTACH",
 							  .section = SECTION_PRE_DATA,
@@ -16449,7 +16592,7 @@ dumpAttrDef(Archive *fout, const AttrDefInfo *adinfo)
 	q = createPQExpBuffer();
 	delq = createPQExpBuffer();
 
-	qualrelname = pg_strdup(fmtQualifiedDumpable(tbinfo));
+	qualrelname = pg_strdup(fmtQualifiedDumpableDest(tbinfo));
 
 	foreign = tbinfo->relkind == RELKIND_FOREIGN_TABLE ? "FOREIGN " : "";
 
@@ -16467,7 +16610,7 @@ dumpAttrDef(Archive *fout, const AttrDefInfo *adinfo)
 	if (adinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, adinfo->dobj.catId, adinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tag,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "DEFAULT",
 								  .section = SECTION_PRE_DATA,
@@ -16535,7 +16678,7 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 	delq = createPQExpBuffer();
 
 	qindxname = pg_strdup(fmtId(indxinfo->dobj.name));
-	qqindxname = pg_strdup(fmtQualifiedDumpable(indxinfo));
+	qqindxname = pg_strdup(fmtQualifiedDumpableDest(indxinfo));
 
 	/*
 	 * If there's an associated constraint, don't dump the index per se, but
@@ -16570,7 +16713,7 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 		if (indxinfo->indisclustered)
 		{
 			appendPQExpBuffer(q, "\nALTER TABLE %s CLUSTER",
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			/* index name is not qualified in this syntax */
 			appendPQExpBuffer(q, " ON %s;\n",
 							  qindxname);
@@ -16615,7 +16758,7 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 		if (indxinfo->indisreplident)
 		{
 			appendPQExpBuffer(q, "\nALTER TABLE ONLY %s REPLICA IDENTITY USING",
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			/* index name is not qualified in this syntax */
 			appendPQExpBuffer(q, " INDEX %s;\n",
 							  qindxname);
@@ -16636,7 +16779,7 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 		if (indxinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 			ArchiveEntry(fout, indxinfo->dobj.catId, indxinfo->dobj.dumpId,
 						 ARCHIVE_OPTS(.tag = indxinfo->dobj.name,
-									  .namespace = tbinfo->dobj.namespace->dobj.name,
+									  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 									  .tablespace = indxinfo->tablespace,
 									  .owner = tbinfo->rolname,
 									  .description = "INDEX",
@@ -16651,7 +16794,7 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 	/* Dump Index Comments */
 	if (indxinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "INDEX", qindxname,
-					tbinfo->dobj.namespace->dobj.name,
+					tbinfo->dobj.namespace,
 					tbinfo->rolname,
 					indxinfo->dobj.catId, 0,
 					is_constraint ? indxinfo->indexconstraint :
@@ -16679,9 +16822,9 @@ dumpIndexAttach(Archive *fout, const IndexAttachInfo *attachinfo)
 		PQExpBuffer q = createPQExpBuffer();
 
 		appendPQExpBuffer(q, "ALTER INDEX %s ",
-						  fmtQualifiedDumpable(attachinfo->parentIdx));
+						  fmtQualifiedDumpableDest(attachinfo->parentIdx));
 		appendPQExpBuffer(q, "ATTACH PARTITION %s;\n",
-						  fmtQualifiedDumpable(attachinfo->partitionIdx));
+						  fmtQualifiedDumpableDest(attachinfo->partitionIdx));
 
 		/*
 		 * There is no need for a dropStmt since the drop is done implicitly
@@ -16696,7 +16839,7 @@ dumpIndexAttach(Archive *fout, const IndexAttachInfo *attachinfo)
 		 */
 		ArchiveEntry(fout, attachinfo->dobj.catId, attachinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = attachinfo->dobj.name,
-								  .namespace = attachinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(attachinfo->dobj.namespace),
 								  .owner = attachinfo->parentIdx->indextable->rolname,
 								  .description = "INDEX ATTACH",
 								  .section = SECTION_POST_DATA,
@@ -16750,19 +16893,19 @@ dumpStatisticsExt(Archive *fout, const StatsExtInfo *statsextinfo)
 	if (statsextinfo->stattarget >= 0)
 	{
 		appendPQExpBuffer(q, "ALTER STATISTICS %s ",
-						  fmtQualifiedDumpable(statsextinfo));
+						  fmtQualifiedDumpableDest(statsextinfo));
 		appendPQExpBuffer(q, "SET STATISTICS %d;\n",
 						  statsextinfo->stattarget);
 	}
 
 	appendPQExpBuffer(delq, "DROP STATISTICS %s;\n",
-					  fmtQualifiedDumpable(statsextinfo));
+					  fmtQualifiedDumpableDest(statsextinfo));
 
 	if (statsextinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, statsextinfo->dobj.catId,
 					 statsextinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = statsextinfo->dobj.name,
-								  .namespace = statsextinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(statsextinfo->dobj.namespace),
 								  .owner = statsextinfo->rolname,
 								  .description = "STATISTICS",
 								  .section = SECTION_POST_DATA,
@@ -16772,7 +16915,7 @@ dumpStatisticsExt(Archive *fout, const StatsExtInfo *statsextinfo)
 	/* Dump Statistics Comments */
 	if (statsextinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "STATISTICS", qstatsextname,
-					statsextinfo->dobj.namespace->dobj.name,
+					statsextinfo->dobj.namespace,
 					statsextinfo->rolname,
 					statsextinfo->dobj.catId, 0,
 					statsextinfo->dobj.dumpId);
@@ -16827,7 +16970,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 											 indxinfo->dobj.catId.oid, true);
 
 		appendPQExpBuffer(q, "ALTER %sTABLE ONLY %s\n", foreign,
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 		appendPQExpBuffer(q, "    ADD CONSTRAINT %s ",
 						  fmtId(coninfo->dobj.name));
 
@@ -16910,7 +17053,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		if (indxinfo->indisclustered)
 		{
 			appendPQExpBuffer(q, "\nALTER TABLE %s CLUSTER",
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			/* index name is not qualified in this syntax */
 			appendPQExpBuffer(q, " ON %s;\n",
 							  fmtId(indxinfo->dobj.name));
@@ -16920,7 +17063,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		if (indxinfo->indisreplident)
 		{
 			appendPQExpBuffer(q, "\nALTER TABLE ONLY %s REPLICA IDENTITY USING",
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			/* index name is not qualified in this syntax */
 			appendPQExpBuffer(q, " INDEX %s;\n",
 							  fmtId(indxinfo->dobj.name));
@@ -16929,10 +17072,10 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		/* Indexes can depend on extensions */
 		append_depends_on_extension(fout, q, &indxinfo->dobj,
 									"pg_catalog.pg_class", "INDEX",
-									fmtQualifiedDumpable(indxinfo));
+									fmtQualifiedDumpableDest(indxinfo));
 
 		appendPQExpBuffer(delq, "ALTER %sTABLE ONLY %s ", foreign,
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 		appendPQExpBuffer(delq, "DROP CONSTRAINT %s;\n",
 						  fmtId(coninfo->dobj.name));
 
@@ -16941,7 +17084,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		if (coninfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 			ArchiveEntry(fout, coninfo->dobj.catId, coninfo->dobj.dumpId,
 						 ARCHIVE_OPTS(.tag = tag,
-									  .namespace = tbinfo->dobj.namespace->dobj.name,
+									  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 									  .tablespace = indxinfo->tablespace,
 									  .owner = tbinfo->rolname,
 									  .description = "CONSTRAINT",
@@ -16966,13 +17109,13 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		 * current table data is not processed
 		 */
 		appendPQExpBuffer(q, "ALTER %sTABLE %s%s\n", foreign,
-						  only, fmtQualifiedDumpable(tbinfo));
+						  only, fmtQualifiedDumpableDest(tbinfo));
 		appendPQExpBuffer(q, "    ADD CONSTRAINT %s %s;\n",
 						  fmtId(coninfo->dobj.name),
 						  coninfo->condef);
 
 		appendPQExpBuffer(delq, "ALTER %sTABLE %s%s ", foreign,
-						  only, fmtQualifiedDumpable(tbinfo));
+						  only, fmtQualifiedDumpableDest(tbinfo));
 		appendPQExpBuffer(delq, "DROP CONSTRAINT %s;\n",
 						  fmtId(coninfo->dobj.name));
 
@@ -16981,7 +17124,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		if (coninfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 			ArchiveEntry(fout, coninfo->dobj.catId, coninfo->dobj.dumpId,
 						 ARCHIVE_OPTS(.tag = tag,
-									  .namespace = tbinfo->dobj.namespace->dobj.name,
+									  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 									  .owner = tbinfo->rolname,
 									  .description = "FK CONSTRAINT",
 									  .section = SECTION_POST_DATA,
@@ -16997,13 +17140,13 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		{
 			/* not ONLY since we want it to propagate to children */
 			appendPQExpBuffer(q, "ALTER %sTABLE %s\n", foreign,
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			appendPQExpBuffer(q, "    ADD CONSTRAINT %s %s;\n",
 							  fmtId(coninfo->dobj.name),
 							  coninfo->condef);
 
 			appendPQExpBuffer(delq, "ALTER %sTABLE %s ", foreign,
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			appendPQExpBuffer(delq, "DROP CONSTRAINT %s;\n",
 							  fmtId(coninfo->dobj.name));
 
@@ -17012,7 +17155,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 			if (coninfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 				ArchiveEntry(fout, coninfo->dobj.catId, coninfo->dobj.dumpId,
 							 ARCHIVE_OPTS(.tag = tag,
-										  .namespace = tbinfo->dobj.namespace->dobj.name,
+										  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 										  .owner = tbinfo->rolname,
 										  .description = "CHECK CONSTRAINT",
 										  .section = SECTION_POST_DATA,
@@ -17029,13 +17172,13 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 		if (coninfo->separate)
 		{
 			appendPQExpBuffer(q, "ALTER DOMAIN %s\n",
-							  fmtQualifiedDumpable(tyinfo));
+							  fmtQualifiedDumpableDest(tyinfo));
 			appendPQExpBuffer(q, "    ADD CONSTRAINT %s %s;\n",
 							  fmtId(coninfo->dobj.name),
 							  coninfo->condef);
 
 			appendPQExpBuffer(delq, "ALTER DOMAIN %s ",
-							  fmtQualifiedDumpable(tyinfo));
+							  fmtQualifiedDumpableDest(tyinfo));
 			appendPQExpBuffer(delq, "DROP CONSTRAINT %s;\n",
 							  fmtId(coninfo->dobj.name));
 
@@ -17044,7 +17187,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 			if (coninfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 				ArchiveEntry(fout, coninfo->dobj.catId, coninfo->dobj.dumpId,
 							 ARCHIVE_OPTS(.tag = tag,
-										  .namespace = tyinfo->dobj.namespace->dobj.name,
+										  .namespace = getDestSchemaName(tyinfo->dobj.namespace),
 										  .owner = tyinfo->rolname,
 										  .description = "CHECK CONSTRAINT",
 										  .section = SECTION_POST_DATA,
@@ -17060,7 +17203,7 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 								  fmtId(coninfo->dobj.name));
 
 				dumpComment(fout, conprefix->data, qtypname,
-							tyinfo->dobj.namespace->dobj.name,
+							tyinfo->dobj.namespace,
 							tyinfo->rolname,
 							coninfo->dobj.catId, 0, tyinfo->dobj.dumpId);
 				destroyPQExpBuffer(conprefix);
@@ -17105,7 +17248,7 @@ dumpTableConstraintComment(Archive *fout, const ConstraintInfo *coninfo)
 
 	if (coninfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, conprefix->data, qtabname,
-					tbinfo->dobj.namespace->dobj.name,
+					tbinfo->dobj.namespace,
 					tbinfo->rolname,
 					coninfo->dobj.catId, 0,
 					coninfo->separate ? coninfo->dobj.dumpId : tbinfo->dobj.dumpId);
@@ -17165,7 +17308,7 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 						  "SELECT 'bigint' AS sequence_type, "
 						  "start_value, increment_by, max_value, min_value, "
 						  "cache_value, is_cycled FROM %s",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableSrc(tbinfo));
 	}
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
@@ -17226,7 +17369,7 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 	if (!tbinfo->is_identity_sequence)
 	{
 		appendPQExpBuffer(delqry, "DROP SEQUENCE %s;\n",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 	}
 
 	resetPQExpBuffer(query);
@@ -17248,7 +17391,7 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 
 		appendPQExpBuffer(query,
 						  "ALTER TABLE %s ",
-						  fmtQualifiedDumpable(owning_tab));
+						  fmtQualifiedDumpableDest(owning_tab));
 		appendPQExpBuffer(query,
 						  "ALTER COLUMN %s ADD GENERATED ",
 						  fmtId(owning_tab->attnames[tbinfo->owning_col - 1]));
@@ -17257,7 +17400,7 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 		else if (owning_tab->attidentity[tbinfo->owning_col - 1] == ATTRIBUTE_IDENTITY_BY_DEFAULT)
 			appendPQExpBufferStr(query, "BY DEFAULT");
 		appendPQExpBuffer(query, " AS IDENTITY (\n    SEQUENCE NAME %s\n",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 
 		/*
 		 * Emit persistence option only if it's different from the owning
@@ -17274,7 +17417,7 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 						  "CREATE %sSEQUENCE %s\n",
 						  tbinfo->relpersistence == RELPERSISTENCE_UNLOGGED ?
 						  "UNLOGGED " : "",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 
 		if (strcmp(seqtype, "bigint") != 0)
 			appendPQExpBuffer(query, "    AS %s\n", seqtype);
@@ -17313,7 +17456,7 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 	if (tbinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tbinfo->dobj.catId, tbinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "SEQUENCE",
 								  .section = SECTION_PRE_DATA,
@@ -17344,16 +17487,16 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 		{
 			resetPQExpBuffer(query);
 			appendPQExpBuffer(query, "ALTER SEQUENCE %s",
-							  fmtQualifiedDumpable(tbinfo));
+							  fmtQualifiedDumpableDest(tbinfo));
 			appendPQExpBuffer(query, " OWNED BY %s",
-							  fmtQualifiedDumpable(owning_tab));
+							  fmtQualifiedDumpableDest(owning_tab));
 			appendPQExpBuffer(query, ".%s;\n",
 							  fmtId(owning_tab->attnames[tbinfo->owning_col - 1]));
 
 			if (tbinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 				ArchiveEntry(fout, nilCatalogId, createDumpId(),
 							 ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
-										  .namespace = tbinfo->dobj.namespace->dobj.name,
+										  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 										  .owner = tbinfo->rolname,
 										  .description = "SEQUENCE OWNED BY",
 										  .section = SECTION_PRE_DATA,
@@ -17366,12 +17509,12 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 	/* Dump Sequence Comments and Security Labels */
 	if (tbinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, "SEQUENCE", qseqname,
-					tbinfo->dobj.namespace->dobj.name, tbinfo->rolname,
+					tbinfo->dobj.namespace, tbinfo->rolname,
 					tbinfo->dobj.catId, 0, tbinfo->dobj.dumpId);
 
 	if (tbinfo->dobj.dump & DUMP_COMPONENT_SECLABEL)
 		dumpSecLabel(fout, "SEQUENCE", qseqname,
-					 tbinfo->dobj.namespace->dobj.name, tbinfo->rolname,
+					 tbinfo->dobj.namespace, tbinfo->rolname,
 					 tbinfo->dobj.catId, 0, tbinfo->dobj.dumpId);
 
 	PQclear(res);
@@ -17396,7 +17539,7 @@ dumpSequenceData(Archive *fout, const TableDataInfo *tdinfo)
 
 	appendPQExpBuffer(query,
 					  "SELECT last_value, is_called FROM %s",
-					  fmtQualifiedDumpable(tbinfo));
+					  fmtQualifiedDumpableSrc(tbinfo));
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
@@ -17411,14 +17554,14 @@ dumpSequenceData(Archive *fout, const TableDataInfo *tdinfo)
 
 	resetPQExpBuffer(query);
 	appendPQExpBufferStr(query, "SELECT pg_catalog.setval(");
-	appendStringLiteralAH(query, fmtQualifiedDumpable(tbinfo), fout);
+	appendStringLiteralAH(query, fmtQualifiedDumpableDest(tbinfo), fout);
 	appendPQExpBuffer(query, ", %s, %s);\n",
 					  last, (called ? "true" : "false"));
 
 	if (tdinfo->dobj.dump & DUMP_COMPONENT_DATA)
 		ArchiveEntry(fout, nilCatalogId, createDumpId(),
 					 ARCHIVE_OPTS(.tag = tbinfo->dobj.name,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "SEQUENCE SET",
 								  .section = SECTION_DATA,
@@ -17463,7 +17606,7 @@ dumpTrigger(Archive *fout, const TriggerInfo *tginfo)
 	qtabname = pg_strdup(fmtId(tbinfo->dobj.name));
 
 	appendPQExpBuffer(trigidentity, "%s ", fmtId(tginfo->dobj.name));
-	appendPQExpBuffer(trigidentity, "ON %s", fmtQualifiedDumpable(tbinfo));
+	appendPQExpBuffer(trigidentity, "ON %s", fmtQualifiedDumpableDest(tbinfo));
 
 	appendPQExpBuffer(delqry, "DROP TRIGGER %s;\n", trigidentity->data);
 
@@ -17526,7 +17669,7 @@ dumpTrigger(Archive *fout, const TriggerInfo *tginfo)
 			findx++;
 		}
 		appendPQExpBuffer(query, " ON %s\n",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 
 		if (tginfo->tgisconstraint)
 		{
@@ -17599,7 +17742,7 @@ dumpTrigger(Archive *fout, const TriggerInfo *tginfo)
 		resetPQExpBuffer(delqry);
 		appendPQExpBuffer(query, "\nALTER %sTABLE %s ",
 						  tbinfo->relkind == RELKIND_FOREIGN_TABLE ? "FOREIGN " : "",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 		switch (tginfo->tgenabled)
 		{
 			case 'f':
@@ -17624,7 +17767,7 @@ dumpTrigger(Archive *fout, const TriggerInfo *tginfo)
 	{
 		appendPQExpBuffer(query, "\nALTER %sTABLE %s ",
 						  tbinfo->relkind == RELKIND_FOREIGN_TABLE ? "FOREIGN " : "",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 		switch (tginfo->tgenabled)
 		{
 			case 'D':
@@ -17653,7 +17796,7 @@ dumpTrigger(Archive *fout, const TriggerInfo *tginfo)
 	if (tginfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, tginfo->dobj.catId, tginfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tag,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "TRIGGER",
 								  .section = SECTION_POST_DATA,
@@ -17662,7 +17805,7 @@ dumpTrigger(Archive *fout, const TriggerInfo *tginfo)
 
 	if (tginfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, trigprefix->data, qtabname,
-					tbinfo->dobj.namespace->dobj.name, tbinfo->rolname,
+					tbinfo->dobj.namespace, tbinfo->rolname,
 					tginfo->dobj.catId, 0, tginfo->dobj.dumpId);
 
 	free(tag);
@@ -17809,7 +17952,7 @@ dumpRule(Archive *fout, const RuleInfo *rinfo)
 		 * Otherwise this should look largely like the regular view dump code.
 		 */
 		appendPQExpBuffer(cmd, "CREATE OR REPLACE VIEW %s",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 		if (nonemptyReloptions(tbinfo->reloptions))
 		{
 			appendPQExpBufferStr(cmd, " WITH (");
@@ -17848,7 +17991,7 @@ dumpRule(Archive *fout, const RuleInfo *rinfo)
 	 */
 	if (rinfo->ev_enabled != 'O')
 	{
-		appendPQExpBuffer(cmd, "ALTER TABLE %s ", fmtQualifiedDumpable(tbinfo));
+		appendPQExpBuffer(cmd, "ALTER TABLE %s ", fmtQualifiedDumpableDest(tbinfo));
 		switch (rinfo->ev_enabled)
 		{
 			case 'A':
@@ -17876,7 +18019,7 @@ dumpRule(Archive *fout, const RuleInfo *rinfo)
 		PQExpBuffer result;
 
 		appendPQExpBuffer(delcmd, "CREATE OR REPLACE VIEW %s",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 		result = createDummyViewAsClause(fout, tbinfo);
 		appendPQExpBuffer(delcmd, " AS\n%s;\n", result->data);
 		destroyPQExpBuffer(result);
@@ -17886,7 +18029,7 @@ dumpRule(Archive *fout, const RuleInfo *rinfo)
 		appendPQExpBuffer(delcmd, "DROP RULE %s ",
 						  fmtId(rinfo->dobj.name));
 		appendPQExpBuffer(delcmd, "ON %s;\n",
-						  fmtQualifiedDumpable(tbinfo));
+						  fmtQualifiedDumpableDest(tbinfo));
 	}
 
 	appendPQExpBuffer(ruleprefix, "RULE %s ON",
@@ -17897,7 +18040,7 @@ dumpRule(Archive *fout, const RuleInfo *rinfo)
 	if (rinfo->dobj.dump & DUMP_COMPONENT_DEFINITION)
 		ArchiveEntry(fout, rinfo->dobj.catId, rinfo->dobj.dumpId,
 					 ARCHIVE_OPTS(.tag = tag,
-								  .namespace = tbinfo->dobj.namespace->dobj.name,
+								  .namespace = getDestSchemaName(tbinfo->dobj.namespace),
 								  .owner = tbinfo->rolname,
 								  .description = "RULE",
 								  .section = SECTION_POST_DATA,
@@ -17907,7 +18050,7 @@ dumpRule(Archive *fout, const RuleInfo *rinfo)
 	/* Dump rule comments */
 	if (rinfo->dobj.dump & DUMP_COMPONENT_COMMENT)
 		dumpComment(fout, ruleprefix->data, qtabname,
-					tbinfo->dobj.namespace->dobj.name,
+					tbinfo->dobj.namespace,
 					tbinfo->rolname,
 					rinfo->dobj.catId, 0, rinfo->dobj.dumpId);
 
